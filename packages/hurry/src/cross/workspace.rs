@@ -14,14 +14,11 @@ use color_eyre::{
     Result, Section, SectionExt,
     eyre::{Context as _, eyre},
 };
-use tracing::{debug, instrument, trace};
-use uuid::Uuid;
+use tracing::{instrument, trace};
 
 use crate::{
-    cargo::{BuildPlan, CargoBuildArguments, RustcTargetPlatform, UnitPlan, Workspace},
+    cargo::{BuildPlan, CargoBuildArguments, RustcTargetPlatform, UnitGraph, UnitPlan, Workspace},
     cross::{self, CrossConfig},
-    fs,
-    path::TryJoinWith as _,
 };
 
 /// Prefix used by cross to mount the target directory.
@@ -35,9 +32,9 @@ const CONTAINER_PROJECT_PREFIX: &str = "/project";
 
 /// Convert a Docker container path to a host filesystem path.
 ///
-/// During `cross` builds, we need to generate the `cargo` build plan inside the
+/// During `cross` builds, we need to generate the Cargo unit graph inside the
 /// container, but then use that to interact with artifacts on the local system.
-/// This function translates the paths reported by the build plan inside the
+/// This function translates the paths reported by the unit graph inside the
 /// container to paths on the local system.
 ///
 /// # Container Path Conventions
@@ -91,123 +88,68 @@ pub fn extract_host_arch(build_plan: &BuildPlan) -> Option<RustcTargetPlatform> 
     None
 }
 
-/// Convert all container paths in a build plan to host paths.
-fn convert_build_plan_paths(build_plan: &mut BuildPlan, workspace: &Workspace) {
-    for invocation in &mut build_plan.invocations {
-        // Convert output paths
-        for output in &mut invocation.outputs {
-            *output = convert_container_path_to_host(output, workspace);
-        }
-
-        // Convert links (HashMap<String, String> where keys are link targets)
-        let links = std::mem::take(&mut invocation.links);
-        invocation.links = links
-            .into_iter()
-            .map(|(target, link)| {
-                (
-                    convert_container_path_to_host(&target, workspace),
-                    convert_container_path_to_host(&link, workspace),
-                )
-            })
-            .collect();
-
-        // Convert program path
-        invocation.program = convert_container_path_to_host(&invocation.program, workspace);
-
-        // Convert cwd
-        invocation.cwd = convert_container_path_to_host(&invocation.cwd, workspace);
-
-        // Convert environment variables that contain paths
-        let env_keys_to_convert = ["OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH"];
-        for key in env_keys_to_convert {
-            if let Some(value) = invocation.env.get(key) {
-                let converted = convert_container_path_to_host(value, workspace);
-                invocation.env.insert(String::from(key), converted);
-            }
-        }
+/// Convert container paths in a unit graph to host paths.
+fn convert_unit_graph_paths(unit_graph: &mut UnitGraph, workspace: &Workspace) {
+    for unit in &mut unit_graph.units {
+        let converted = convert_container_path_to_host(
+            unit.target
+                .src_path
+                .as_std_path()
+                .to_string_lossy()
+                .as_ref(),
+            workspace,
+        );
+        unit.target.src_path = converted.into();
     }
 }
 
 impl Workspace {
     /// Compute the unit plans for a cross build.
     ///
-    /// This is similar to `units()` but uses `cross_build_plan()` which:
-    /// 1. Runs the build plan inside the cross container
+    /// This is similar to `units()` but uses `cross_unit_graph()` which:
+    /// 1. Runs the unit graph inside the cross container
     /// 2. Converts container paths to host paths
     ///
     /// Since the paths are converted to host paths before unit parsing,
     /// the rest of the logic is identical to regular cargo builds.
-    /// We delegate to the shared `units_from_build_plan()` helper
+    /// We delegate to the shared `units_from_unit_graph()` helper
     /// to avoid code duplication.
     #[instrument(name = "Workspace::cross_units")]
     pub async fn cross_units(
         &self,
         args: impl AsRef<CargoBuildArguments> + Debug,
     ) -> Result<Vec<UnitPlan>> {
-        let build_plan = self.cross_build_plan(&args).await?;
-        self.units_from_build_plan(build_plan).await
+        let unit_graph = self.cross_unit_graph(&args).await?;
+        self.units_from_unit_graph(unit_graph).await
     }
 
-    /// Get the build plan by running `cross build --build-plan`.
+    /// Get the unit graph by running `cross build --unit-graph`.
     ///
-    /// This is similar to the regular `build_plan()` method but with key
+    /// This is similar to the regular `unit_graph()` method but with key
     /// differences:
     ///
-    /// 1. The build plan is executed through `cross` (inside a Docker
+    /// 1. The unit graph is executed through `cross` (inside a Docker
     ///    container)
     /// 2. Container paths are converted to host paths after parsing
     /// 3. Cross.toml is configured to pass through RUSTC_BOOTSTRAP
     ///
     /// # Container Path Conversion
     ///
-    /// Cross mounts the target directory at `/target` inside the container.
-    /// The build plan will report paths like `/target/debug/libfoo.rlib`,
-    /// which we need to convert to the actual host paths like
-    /// `/Users/jess/project/target/debug/libfoo.rlib`.
-    #[instrument(name = "Workspace::cross_build_plan")]
-    pub async fn cross_build_plan(
+    /// Cross mounts source paths inside the container, so unit graph source
+    /// paths need to be converted back to host paths before planning units.
+    #[instrument(name = "Workspace::cross_unit_graph")]
+    pub async fn cross_unit_graph(
         &self,
         args: impl AsRef<CargoBuildArguments> + Debug,
-    ) -> Result<BuildPlan> {
-        // Running `cross build --build-plan` resets the state in the `target`
-        // directory, just like cargo. We use the same rename workaround.
-        let renamed = if fs::exists(&self.build_dir).await {
-            debug!("target exists before running build plan, renaming");
-            let temp = self
-                .root
-                .try_join_dir(format!("target.backup.{}", Uuid::new_v4()))?;
-
-            let renamed = fs::rename(&self.build_dir, &temp).await.is_ok();
-            debug!(?renamed, ?temp, "renamed temp target");
-            if renamed { Some(temp) } else { None }
-        } else {
-            debug!("target does not exist before running build plan");
-            None
-        };
-
-        let ret = self.cross_build_plan_inner(args).await;
-
-        if let Some(temp) = renamed {
-            debug!("restoring original target");
-            fs::remove_dir_all(&self.build_dir).await?;
-            fs::rename(&temp, &self.build_dir).await?;
-            debug!("restored original target");
-        } else {
-            // When the build directory didn't exist at the start, we need to
-            // clean up the newly created extraneous build directory.
-            debug!(build_dir = ?self.build_dir, "build plan done, cleaning up target");
-            fs::remove_dir_all(&self.build_dir).await?;
-            debug!("build plan done, done cleaning target");
-        }
-
-        ret
+    ) -> Result<UnitGraph> {
+        self.cross_unit_graph_inner(args).await
     }
 
-    #[instrument(name = "Workspace::cross_build_plan_inner")]
-    async fn cross_build_plan_inner(
+    #[instrument(name = "Workspace::cross_unit_graph_inner")]
+    async fn cross_unit_graph_inner(
         &self,
         args: impl AsRef<CargoBuildArguments> + Debug,
-    ) -> Result<BuildPlan> {
+    ) -> Result<UnitGraph> {
         // Set up temporary Cross.toml with RUSTC_BOOTSTRAP passthrough.
         // The config is kept alive for the duration of the cross invocation.
         let cross_config = CrossConfig::setup(&self.root)
@@ -216,7 +158,7 @@ impl Workspace {
 
         let mut build_args = args.as_ref().to_argv();
         build_args.extend([
-            String::from("--build-plan"),
+            String::from("--unit-graph"),
             String::from("-Z"),
             String::from("unstable-options"),
         ]);
@@ -234,14 +176,14 @@ impl Workspace {
         // Handle --message-format=json which produces NDJSON output
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-            if let Ok(mut plan) = serde_json::from_str::<BuildPlan>(line) {
-                convert_build_plan_paths(&mut plan, self);
+            if let Ok(mut plan) = serde_json::from_str::<UnitGraph>(line) {
+                convert_unit_graph_paths(&mut plan, self);
                 return Ok(plan);
             }
         }
 
-        Err(eyre!("no valid build plan found in output"))
-            .context("parse build plan")
+        Err(eyre!("no valid unit graph found in output"))
+            .context("parse unit graph")
             .with_section(move || stdout.to_string().header("Stdout:"))
             .with_section(move || {
                 String::from_utf8_lossy(&output.stderr)
@@ -258,7 +200,7 @@ mod tests {
     use super::*;
     use crate::{
         cargo::{BuildPlanInvocation, CargoCompileMode},
-        path::AbsDirPath,
+        path::{AbsDirPath, TryJoinWith as _},
     };
 
     fn workspace(root: &str, cargo_home: &str) -> Workspace {

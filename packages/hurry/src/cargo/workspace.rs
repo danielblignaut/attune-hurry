@@ -10,19 +10,20 @@ use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use tap::{Conv as _, Tap as _, TapFallible as _, TryConv as _};
 use tokio::task::spawn_blocking;
-use tracing::{debug, instrument, trace};
-use uuid::Uuid;
+use tracing::{instrument, trace};
 
 use crate::{
     cargo::{
         self, BuildPlan, BuildScriptCompilationUnitPlan, BuildScriptExecutionUnitPlan,
         CargoBuildArguments, CargoCompileMode, Fingerprint, LibraryCrateUnitPlan, Profile,
-        RustcArguments, RustcTarget, RustcTargetPlatform,
+        RustcArguments, RustcTarget, RustcTargetPlatform, UnitGraph,
     },
-    fs, mk_rel_dir,
+    mk_rel_dir,
     path::{AbsDirPath, AbsFilePath, RelDirPath, RelFilePath, RelativeTo as _, TryJoinWith as _},
 };
 use clients::courier::v1 as courier;
+
+use super::unit_hash;
 
 /// The Cargo workspace of a build.
 ///
@@ -232,60 +233,104 @@ impl Workspace {
         }
     }
 
-    /// Get the build plan by running `cargo build --build-plan` with the
-    /// provided arguments.
-    #[instrument(name = "Workspace::build_plan")]
-    async fn build_plan(
-        &self,
-        args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
-    ) -> Result<BuildPlan> {
-        // Running `cargo build --build-plan` resets the state in the `target`
-        // directory. To work around this we temporarily rename `target`, run
-        // the build plan, and move it back. If the rename fails (e.g.,
-        // permissions, cross-device), we proceed without it; this will then
-        // have the original issue but at least won't break the build.
-        let renamed = if fs::exists(&self.build_dir).await {
-            debug!("target exists before running build plan, renaming");
-            let temp = self
-                .root
-                .try_join_dir(format!("target.backup.{}", Uuid::new_v4()))?;
-
-            let renamed = fs::rename(&self.build_dir, &temp).await.is_ok();
-            debug!(?renamed, ?temp, "renamed temp target");
-            if renamed { Some(temp) } else { None }
-        } else {
-            debug!("target does not exist before running build plan");
-            None
-        };
-
-        let ret = self.build_plan_inner(args).await;
-
-        if let Some(temp) = renamed {
-            debug!("restoring original target");
-            fs::remove_dir_all(&self.build_dir).await?;
-            fs::rename(&temp, &self.build_dir).await?;
-            debug!("restored original target");
-        } else {
-            // When the build directory didn't exist at the start, we need to
-            // clean up the newly created extraneous build directory.
-            debug!(build_dir = ?self.build_dir, "build plan done, cleaning up target");
-            fs::remove_dir_all(&self.build_dir).await?;
-            debug!("build plan done, done cleaning target");
+    async fn rustc_verbose_version(&self) -> Result<String> {
+        let output = tokio::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .await
+            .context("run rustc -vV")?;
+        if !output.status.success() {
+            return Err(eyre!("invoke rustc -vV"))
+                .with_section(|| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .to_string()
+                        .header("Stdout:")
+                })
+                .with_section(|| {
+                    String::from_utf8_lossy(&output.stderr)
+                        .to_string()
+                        .header("Stderr:")
+                });
         }
-
-        ret
+        Ok(String::from_utf8(output.stdout)?)
     }
 
-    #[instrument(name = "Workspace::build_plan_inner")]
-    async fn build_plan_inner(
+    fn reconstructed_library_outputs(
+        &self,
+        info: &UnitPlanInfo,
+        target_kind: &[TargetKind],
+    ) -> Result<Vec<AbsFilePath>> {
+        let deps_dir = self
+            .unit_profile_dir(info)
+            .try_join_dir("deps")
+            .context("construct deps dir")?;
+        let name = info.crate_name.as_str();
+        let hash = info.unit_hash.to_string();
+        let mut outputs = Vec::new();
+
+        if target_kind.contains(&TargetKind::Lib) || target_kind.contains(&TargetKind::RLib) {
+            outputs.push(deps_dir.try_join_file(format!("lib{name}-{hash}.rlib"))?);
+            outputs.push(deps_dir.try_join_file(format!("lib{name}-{hash}.rmeta"))?);
+        }
+
+        if target_kind.contains(&TargetKind::ProcMacro) {
+            outputs.push(deps_dir.try_join_file(format!(
+                "{}{name}-{hash}{}",
+                self.dynamic_library_prefix(&info.target_arch),
+                self.dynamic_library_suffix(&info.target_arch)
+            ))?);
+        }
+
+        if target_kind.contains(&TargetKind::CDyLib) {
+            outputs.push(deps_dir.try_join_file(format!(
+                "{}{name}-{hash}{}",
+                self.dynamic_library_prefix(&info.target_arch),
+                self.dynamic_library_suffix(&info.target_arch)
+            ))?);
+        }
+
+        if outputs.is_empty() {
+            bail!("no reconstructed outputs for target kind: {target_kind:?}");
+        }
+
+        Ok(outputs)
+    }
+
+    fn dynamic_library_prefix(&self, target_arch: &RustcTarget) -> &'static str {
+        match target_arch.as_str().unwrap_or(self.host_arch.as_str()) {
+            target if target.contains("windows") => "",
+            _ => "lib",
+        }
+    }
+
+    fn dynamic_library_suffix(&self, target_arch: &RustcTarget) -> &'static str {
+        match target_arch.as_str().unwrap_or(self.host_arch.as_str()) {
+            target if target.contains("apple") => ".dylib",
+            target if target.contains("windows") => ".dll",
+            _ => ".so",
+        }
+    }
+
+    /// Get the unit graph by running `cargo build --unit-graph` with the
+    /// provided arguments.
+    #[instrument(name = "Workspace::unit_graph")]
+    pub(crate) async fn unit_graph(
         &self,
         args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
-    ) -> Result<BuildPlan> {
+    ) -> Result<UnitGraph> {
+        self.unit_graph_inner(args).await
+    }
+
+    #[instrument(name = "Workspace::unit_graph_inner")]
+    async fn unit_graph_inner(
+        &self,
+        args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
+    ) -> Result<UnitGraph> {
         // TODO: Handle cases where users pass weird options, including if the
-        // user themselves passed `--build-plan`.
+        // user themselves passed `--unit-graph`.
         let mut build_args = args.as_ref().to_argv();
         build_args.extend([
-            String::from("--build-plan"),
+            String::from("--unit-graph"),
             String::from("-Z"),
             String::from("unstable-options"),
         ]);
@@ -293,9 +338,9 @@ impl Workspace {
             .await
             .context("run cargo command")?;
 
-        // When users pass flags like
-        // `--message-format=json`, cargo outputs NDJSON (newline-delimited JSON)
-        // where the build plan is one of multiple JSON objects. We try parsing
+        // When users pass flags like `--message-format=json`, cargo can output
+        // NDJSON (newline-delimited JSON) where the unit graph is one of
+        // multiple JSON objects. We try parsing
         // each line until we find one with the `invocations` field.
         //
         // We do this instead of e.g. filtering the `--message-format` field because we
@@ -303,14 +348,14 @@ impl Workspace {
         // revisit.
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-            if let Ok(plan) = serde_json::from_str::<BuildPlan>(line) {
+            if let Ok(plan) = serde_json::from_str::<UnitGraph>(line) {
                 return Ok(plan);
             }
         }
 
-        // If we didn't find a valid build plan, return an error with context
-        Err(eyre!("no valid build plan found in output"))
-            .context("parse build plan")
+        // If we didn't find a valid unit graph, return an error with context.
+        Err(eyre!("no valid unit graph found in output"))
+            .context("parse unit graph")
             .with_section(move || stdout.to_string().header("Stdout:"))
             .with_section(move || {
                 String::from_utf8_lossy(&output.stderr)
@@ -325,22 +370,90 @@ impl Workspace {
         // TODO: These should just use self.args.
         args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
     ) -> Result<Vec<UnitPlan>> {
-        // Note that build plans as a feature are deprecated[^1]. If a stable
-        // alternative comes along, we should migrate.
-        //
-        // An alternative is the `--unit-graph` flag, which is unstable but not
-        // deprecated[^2]. Unfortunately, unit graphs do not provide information
-        // about the `rustc` invocation argv or the unit hash of the build
-        // script execution, both of which are necessary to construct the
-        // artifact cache key. We could theoretically reconstruct this
-        // information using the JSON build messages and RUSTC_WRAPPER
-        // invocation recording, but that's way more work for no stronger of a
-        // stability guarantee.
-        //
-        // [^1]: https://github.com/rust-lang/cargo/issues/7614
-        // [^2]: https://doc.rust-lang.org/cargo/reference/unstable.html#unit-graph
-        let build_plan = self.build_plan(&args).await?;
-        self.units_from_build_plan(build_plan).await
+        let unit_graph = self.unit_graph(&args).await?;
+        self.units_from_unit_graph(unit_graph).await
+    }
+
+    #[instrument(name = "Workspace::units_from_unit_graph", skip(unit_graph))]
+    pub(crate) async fn units_from_unit_graph(
+        &self,
+        unit_graph: UnitGraph,
+    ) -> Result<Vec<UnitPlan>> {
+        trace!(?unit_graph, "unit graph");
+
+        let rustc_verbose_version = self.rustc_verbose_version().await?;
+        let metadata = unit_hash::compute_all(
+            &unit_graph.units,
+            &rustc_verbose_version,
+            self.root.as_std_path().to_string_lossy().as_ref(),
+        )?;
+
+        let mut index_to_hash = HashMap::new();
+        for (idx, meta) in &metadata {
+            index_to_hash.insert(*idx, UnitHash::from(meta.unit_hash()));
+        }
+
+        let mut units = Vec::new();
+        for (idx, unit) in unit_graph.units.into_iter().enumerate() {
+            trace!(?unit, "unit graph unit");
+
+            let src_path = unit.src_path()?;
+            if src_path.relative_to(&self.cargo_home).is_err() {
+                trace!("skipping: package outside of $CARGO_HOME");
+                continue;
+            }
+
+            if unit.is_binary() {
+                continue;
+            }
+
+            let Some(unit_hash) = index_to_hash.get(&idx).cloned() else {
+                continue;
+            };
+            let (package_name, package_version) = unit.package_name_version()?;
+            let target_arch = unit.target_arch();
+            let deps = unit
+                .dependencies
+                .iter()
+                .filter_map(|dep| index_to_hash.get(&dep.index).cloned())
+                .collect::<Vec<_>>();
+
+            let info = UnitPlanInfo {
+                unit_hash,
+                package_name,
+                package_version,
+                crate_name: unit.crate_name(),
+                target_arch,
+                deps,
+            };
+
+            let plan = if unit.is_build_script_compilation() {
+                UnitPlan::BuildScriptCompilation(BuildScriptCompilationUnitPlan { info, src_path })
+            } else if unit.is_build_script_execution() {
+                let build_script_program_name = unit
+                    .target
+                    .src_path
+                    .file_stem()
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| String::from("build"));
+                UnitPlan::BuildScriptExecution(BuildScriptExecutionUnitPlan {
+                    info,
+                    build_script_program_name: format!("build-script-{build_script_program_name}"),
+                })
+            } else if unit.is_cacheable_library() {
+                let outputs = self.reconstructed_library_outputs(&info, &unit.target.kind)?;
+                UnitPlan::LibraryCrate(LibraryCrateUnitPlan {
+                    info,
+                    src_path,
+                    outputs,
+                })
+            } else {
+                bail!("unsupported target kind: {:?}", unit.target.kind);
+            };
+            units.push(plan);
+        }
+
+        Ok(units)
     }
 
     /// Parse unit plans from a build plan.
@@ -353,6 +466,7 @@ impl Workspace {
     /// container paths should already be converted before calling this
     /// method).
     #[instrument(name = "Workspace::units_from_build_plan", skip(build_plan))]
+    #[allow(dead_code)]
     pub(crate) async fn units_from_build_plan(
         &self,
         build_plan: BuildPlan,
@@ -734,19 +848,18 @@ pub struct UnitPlanInfo {
 
     /// The dependencies of this unit.
     ///
-    /// This is parsed from the dependencies in the unit's build plan
-    /// invocation. Note that units can depend on arbitrary other units. For
-    /// example, build script executions can depend on other build script
-    /// executions because of the `links` field[^1] or library crates if they
-    /// use those libraries.
+    /// This is parsed from the dependencies in Cargo's unit graph. Note that
+    /// units can depend on arbitrary other units. For example, build script
+    /// executions can depend on other build script executions because of the
+    /// `links` field[^1] or library crates if they use those libraries.
     ///
     /// This is used to rewrite the unit's fingerprint on restore by rewriting
     /// the fingerprints in the `deps` field.
     ///
     /// [^1]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key
-    // This field is not serialized because indexes may not be valid between
-    // build plan invocations, and this value should be parsed from the build
-    // plan on every build. This does not impact correctness because the
+    // This field is not serialized because graph indexes may not be valid between
+    // invocations, and this value should be parsed from the unit graph on every
+    // build. This does not impact correctness because the
     // dependencies of a unit already have their hash baked into the unit's
     // hash.[^1]
     //
@@ -861,11 +974,11 @@ mod tests {
     use pretty_assertions::assert_eq as pretty_assert_eq;
 
     #[tokio::test]
-    async fn build_plan_flag_order_does_not_matter() {
+    async fn unit_graph_flag_order_does_not_matter() {
         // This is a relatively basic test to start with; if we find other edge
         // cases we want to test we should add them here (or in a similar test).
         let user_args = ["--release"];
-        let tool_args = ["--build-plan", "-Z", "unstable-options"];
+        let tool_args = ["--unit-graph", "-Z", "unstable-options"];
         let env = [("RUSTC_BOOTSTRAP", "1")];
         let cmd = "build";
 
@@ -881,19 +994,19 @@ mod tests {
             Err(e) => panic!("tool args first should succeed: {e}"),
         };
 
-        let user_plan = serde_json::from_slice::<BuildPlan>(&user_args_first).unwrap();
-        let tool_plan = serde_json::from_slice::<BuildPlan>(&tool_args_first).unwrap();
+        let user_plan = serde_json::from_slice::<UnitGraph>(&user_args_first).unwrap();
+        let tool_plan = serde_json::from_slice::<UnitGraph>(&tool_args_first).unwrap();
         pretty_assert_eq!(
-            user_plan,
-            tool_plan,
-            "both orderings should produce same build plan"
+            user_plan.units.len(),
+            tool_plan.units.len(),
+            "both orderings should produce same unit graph"
         );
     }
 
     #[tokio::test]
-    async fn build_plan_with_message_format_json() {
+    async fn unit_graph_with_message_format_json() {
         // When --message-format=json is passed, cargo outputs NDJSON
-        // (newline-delimited JSON) where the build plan is one of multiple
+        // (newline-delimited JSON) where the unit graph is one of multiple
         // JSON objects. We should still be able to parse it.
         let args = CargoBuildArguments::from_iter(vec!["--message-format=json-render-diagnostics"]);
         let workspace = Workspace::from_argv(&args)
@@ -901,12 +1014,12 @@ mod tests {
             .expect("should open workspace");
 
         let plan = workspace
-            .build_plan(&args)
+            .unit_graph(&args)
             .await
-            .expect("should parse build plan from NDJSON output");
+            .expect("should parse unit graph from NDJSON output");
 
-        // Basic sanity checks that we got a valid build plan
-        assert!(!plan.invocations.is_empty(), "should have invocations");
-        assert!(!plan.inputs.is_empty(), "should have inputs");
+        // Basic sanity checks that we got a valid unit graph.
+        assert!(!plan.units.is_empty(), "should have units");
+        assert!(!plan.roots.is_empty(), "should have roots");
     }
 }

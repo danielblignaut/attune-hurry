@@ -24,6 +24,7 @@ mod path;
 mod profile;
 mod rustc;
 mod unit_graph;
+mod unit_hash;
 mod units;
 mod workspace;
 

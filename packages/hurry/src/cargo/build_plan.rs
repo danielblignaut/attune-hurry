@@ -131,37 +131,37 @@ impl BuildPlanInvocation {
 
 #[cfg(test)]
 mod tests {
-    use color_eyre::{Result, Section as _, SectionExt as _, eyre::Context as _};
+    use color_eyre::Result;
 
     use super::*;
 
     #[test]
-    fn parse_build_plan_smoke() -> Result<()> {
+    fn parse_legacy_build_plan_shape() -> Result<()> {
         let _ = color_eyre::install();
 
-        let output = std::process::Command::new("cargo")
-            .args(["build", "--build-plan", "-Z", "unstable-options"])
-            .env("RUSTC_BOOTSTRAP", "1")
-            .output()
-            .expect("execute cargo build-plan");
-
-        assert!(
-            output.status.success(),
-            "cargo build-plan failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let build_plan = serde_json::from_slice::<BuildPlan>(&output.stdout)
-            .with_section(|| {
-                String::from_utf8_lossy(&output.stdout)
-                    .to_string()
-                    .header("Build Plan:")
-            })
-            .context("parse build plan JSON")?;
+        let build_plan = serde_json::from_str::<BuildPlan>(
+            r#"{
+                "invocations": [{
+                    "package_name": "serde",
+                    "package_version": "1.0.0",
+                    "target_kind": ["lib"],
+                    "kind": null,
+                    "compile_mode": "build",
+                    "deps": [],
+                    "outputs": ["/workspace/target/debug/deps/libserde-0123456789abcdef.rlib"],
+                    "links": {},
+                    "program": "rustc",
+                    "args": [],
+                    "env": {},
+                    "cwd": "/cargo/registry/src/serde-1.0.0"
+                }],
+                "inputs": []
+            }"#,
+        )?;
 
         assert!(
             !build_plan.invocations.is_empty(),
-            "build plan should have invocations"
+            "legacy build plan should have invocations"
         );
 
         Ok(())

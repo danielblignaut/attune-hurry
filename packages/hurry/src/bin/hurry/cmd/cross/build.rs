@@ -1,7 +1,7 @@
 //! Builds cross-compiled projects using an optimized cache.
 //!
 //! This is similar to `cargo build` but uses `cross` for cross-compilation.
-//! The caching logic is identical - we just run build plans through the
+//! The caching logic is identical - we just run unit graphs through the
 //! cross container and convert container paths to host paths before caching.
 
 use std::time::Duration;
@@ -123,9 +123,9 @@ pub async fn exec(options: Options) -> Result<()> {
         .context("opening workspace")?;
     debug!(?workspace, "opened workspace");
 
-    // Compute expected unit plans using cross build plan.
+    // Compute expected unit plans using cross unit graph.
     // If this fails (unsupported target, etc.), fall back to passthrough.
-    println!("[hurry] Computing build plan inside Cross context");
+    println!("[hurry] Computing unit graph inside Cross context");
     let units = match workspace.cross_units(&args).await {
         Ok(units) => units,
         Err(error) => {

@@ -181,7 +181,7 @@ pub async fn exec(options: Options) -> Result<()> {
         // `cargo clean` the very first time they ran `hurry` in a project).
         //
         // Instead, we reconstruct the `rustc` invocation from a combination of:
-        // 1. The base static invocation for a package from the build plan.
+        // 1. The unit graph and reconstructed Cargo unit metadata.
         // 2. The parsed build script outputs for a package.
         //
         // Theoretically, there is no stable interface that guarantees that this
@@ -201,7 +201,7 @@ pub async fn exec(options: Options) -> Result<()> {
         //
         // We don't use this integration point for two reasons:
         // 1. These messages don't actually give us anything that we don't already get
-        //    from the build plan and build script output.
+        //    from the unit graph and build script output.
         // 2. Enabling this flag actually _changes_ the interactive user messages on
         //    STDERR. In particular, certain warnings and progress messages are
         //    different (because they are now emitted on STDOUT as JSON messages e.g.
@@ -209,7 +209,7 @@ pub async fn exec(options: Options) -> Result<()> {
         //    repaint the progress bar when messages are emitted.
         //
         // It's just a whole lot of effort for no incremental value. Instead, we
-        // reconstruct information from these messages using the build plan and
+        // reconstruct information from these messages using the unit graph and
         // the target directory's build script outputs.
         //
         // [^2]: https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
