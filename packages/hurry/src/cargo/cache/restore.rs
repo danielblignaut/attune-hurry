@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -45,6 +46,12 @@ struct FileRestoreKey {
     )]
     #[debug(skip)]
     write: Box<dyn FnOnce(&Vec<u8>) -> BoxFuture<'static, Result<()>> + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct FingerprintRestoreInput {
+    src_path: Option<PathBuf>,
+    fingerprint: Fingerprint,
 }
 
 /// Tracks restore progress. It does this by tracking which units have been
@@ -162,6 +169,9 @@ pub async fn restore_units(
             "filtered units with incomplete dependency chains"
         );
     }
+
+    let fingerprint_inputs =
+        cached_fingerprint_inputs(units, &saved_units, &units_with_incomplete_deps)?;
 
     // Track restore progress.
     let restore_progress = RestoreProgress::default();
@@ -345,7 +355,12 @@ pub async fn restore_units(
         // into Cargo.
         let info = unit.info();
         let src_path = unit.src_path().map(|p| p.into());
-        let rewritten_fingerprint = cached_fingerprint.rewrite(src_path, &mut dep_fingerprints)?;
+        let rewritten_fingerprint = rewrite_fingerprint_for_restore(
+            src_path,
+            &fingerprint_inputs,
+            &mut dep_fingerprints,
+            cached_fingerprint,
+        )?;
         let fingerprint_hash = rewritten_fingerprint.fingerprint_hash();
 
         // Write the rewritten fingerprint.
@@ -816,6 +831,93 @@ fn unit_type_name(unit: &UnitPlan) -> &'static str {
         UnitPlan::BuildScriptCompilation(_) => "BuildScriptCompilation",
         UnitPlan::BuildScriptExecution(_) => "BuildScriptExecution",
     }
+}
+
+fn cached_fingerprint_inputs(
+    units: &[UnitPlan],
+    saved_units: &CargoRestoreResponse,
+    units_with_incomplete_deps: &HashSet<UnitHash>,
+) -> Result<HashMap<u64, FingerprintRestoreInput>> {
+    let mut fingerprint_inputs = HashMap::new();
+
+    for unit in units {
+        let unit_hash = &unit.info().unit_hash;
+        if units_with_incomplete_deps.contains(unit_hash) {
+            continue;
+        }
+
+        let Some(saved) = saved_units.get(&unit_hash.into()) else {
+            continue;
+        };
+
+        let fingerprint = saved.fingerprint().as_str();
+        let fingerprint = serde_json::from_str::<Fingerprint>(fingerprint)?;
+        let fingerprint_hash = fingerprint.hash_u64();
+        fingerprint_inputs.insert(
+            fingerprint_hash,
+            FingerprintRestoreInput {
+                src_path: unit.src_path().map(|p| p.into()),
+                fingerprint,
+            },
+        );
+    }
+
+    Ok(fingerprint_inputs)
+}
+
+fn rewrite_fingerprint_for_restore(
+    src_path: Option<PathBuf>,
+    fingerprint_inputs: &HashMap<u64, FingerprintRestoreInput>,
+    dep_fingerprints: &mut HashMap<u64, Fingerprint>,
+    fingerprint: Fingerprint,
+) -> Result<Fingerprint> {
+    let mut visiting = HashSet::new();
+    rewrite_fingerprint_for_restore_inner(
+        src_path,
+        fingerprint_inputs,
+        dep_fingerprints,
+        &mut visiting,
+        fingerprint,
+    )
+}
+
+fn rewrite_fingerprint_for_restore_inner(
+    src_path: Option<PathBuf>,
+    fingerprint_inputs: &HashMap<u64, FingerprintRestoreInput>,
+    dep_fingerprints: &mut HashMap<u64, Fingerprint>,
+    visiting: &mut HashSet<u64>,
+    fingerprint: Fingerprint,
+) -> Result<Fingerprint> {
+    let old_hash = fingerprint.hash_u64();
+    if let Some(rewritten) = dep_fingerprints.get(&old_hash) {
+        return Ok(rewritten.clone());
+    }
+    if !visiting.insert(old_hash) {
+        bail!("cycle in fingerprint dependencies");
+    }
+
+    for dep in &fingerprint.deps {
+        let dep_hash = dep.fingerprint.hash_u64();
+        if dep_fingerprints.contains_key(&dep_hash) {
+            continue;
+        }
+
+        let input = fingerprint_inputs
+            .get(&dep_hash)
+            .cloned()
+            .ok_or_eyre("dependency fingerprint hash not found")?;
+        rewrite_fingerprint_for_restore_inner(
+            input.src_path,
+            fingerprint_inputs,
+            dep_fingerprints,
+            visiting,
+            input.fingerprint,
+        )?;
+    }
+
+    let rewritten = fingerprint.rewrite(src_path, dep_fingerprints)?;
+    visiting.remove(&old_hash);
+    Ok(rewritten)
 }
 
 /// Filter units to only those with complete dependency chains.

@@ -15,7 +15,7 @@ use color_eyre::{
     eyre::{Context as _, OptionExt as _, bail},
 };
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tap::Pipe as _;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -47,9 +47,10 @@ impl DaemonPaths {
             let pid = fs::must_read_buffered_utf8(&self.pid_file_path).await?;
             match pid.trim().parse::<u32>() {
                 Ok(pid) => {
-                    let system = System::new_with_specifics(
+                    let mut system = System::new_with_specifics(
                         RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
                     );
+                    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
                     let process = system.process(Pid::from_u32(pid));
                     match process {
                         Some(_) => self.read_context().await?,

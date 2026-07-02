@@ -114,6 +114,53 @@ impl CargoCache {
         Ok(request_id)
     }
 
+    #[instrument(name = "CargoCache::save_sync", skip_all)]
+    pub async fn save_sync(
+        &self,
+        units: Vec<UnitPlan>,
+        restored: Restored,
+        progress: &TransferBar,
+    ) -> Result<()> {
+        let mut last_uploaded_units = 0u64;
+        let mut last_uploaded_files = 0u64;
+        let mut last_uploaded_bytes = 0u64;
+        let mut last_total_units = units.len() as u64;
+
+        save_units(
+            &self.courier,
+            &self.cas,
+            self.ws.clone(),
+            units,
+            restored,
+            |save_progress| {
+                progress.add_bytes(
+                    save_progress
+                        .uploaded_bytes
+                        .saturating_sub(last_uploaded_bytes),
+                );
+                last_uploaded_bytes = save_progress.uploaded_bytes;
+
+                progress.add_files(
+                    save_progress
+                        .uploaded_files
+                        .saturating_sub(last_uploaded_files),
+                );
+                last_uploaded_files = save_progress.uploaded_files;
+
+                progress.inc(
+                    save_progress
+                        .uploaded_units
+                        .saturating_sub(last_uploaded_units),
+                );
+                last_uploaded_units = save_progress.uploaded_units;
+
+                progress.dec_length(last_total_units.saturating_sub(save_progress.total_units));
+                last_total_units = save_progress.total_units;
+            },
+        )
+        .await
+    }
+
     #[instrument(name = "CargoCache::restore", skip_all)]
     pub async fn restore(&self, units: &Vec<UnitPlan>, progress: &TransferBar) -> Result<Restored> {
         restore_units(&self.courier, &self.cas, &self.ws, units, progress).await

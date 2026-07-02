@@ -384,7 +384,7 @@ There are several ways to get build information out of Cargo:
 2. `cargo metadata` provides information about the "packages" and "resolved dependencies" of the workspace.
 3. `cargo build --message-format=json-diagnostic-rendered-ansi` provides formatted output messages from the compiler as it runs.
 4. `cargo build --unit-graph` provides information about the "unit graph" of the build.
-5. `cargo build --build-plan` provides information about the "build plan" of the build.
+5. Older Cargo versions had `cargo build --build-plan`, but Cargo 1.93 removed it.
 6. Reading the `./output` file of a build script execution provides the recorded build script output.
 
 Each of these methods has their own trade-offs, and they're all incomplete or inconvenient in various ways. In order to get the information we need, we combine all of these methods.
@@ -454,18 +454,16 @@ Some not-so-nice properties of this format:
 
 #### `cargo build` build plan
 
-`cargo +nightly build --build-plan -Z unstable-options` provides information about the "build plan" of the build. This format is documented [here](https://doc.rust-lang.org/cargo/reference/unstable.html#build-plan). Note that we can invoke this behavior on the stable Cargo tool by setting `RUSTC_BOOTSTRAP=1`.
+Older Hurry versions used `cargo +nightly build --build-plan -Z unstable-options` to inspect Cargo's planned invocations. Cargo removed this flag in 1.93, so Hurry no longer uses it.
 
-Some nice properties of this format:
+Some nice properties of the removed format were:
 
-1. It provides the artifact names of all generated outputs.
-2. It provides all `rustc` invocations _and_ all build script invocations, including environment variables.
-3. It ties each invocation to the package being built.
-4. It provides a dependency graph of invocations.
+1. It provided the artifact names of all generated outputs.
+2. It provided all `rustc` invocations _and_ all build script invocations, including environment variables.
+3. It tied each invocation to the package being built.
+4. It provided a dependency graph of invocations.
 
-Some not-so-nice properties of this format:
-
-1. The feature is allegedly deprecated, although it has not been removed in [six years](https://github.com/rust-lang/cargo/issues/7614).
+Because `unit-graph` does not provide output filenames or Cargo's unit hash directly, Hurry now reconstructs those values from the unit graph, target layout rules, and a local mirror of Cargo's metadata hash inputs.
 
 #### Reading build script `./output`
 
@@ -473,16 +471,16 @@ Some not-so-nice properties of this format:
 
 First, at the start of a build, we construct an _artifact plan_. This is information about expected artifacts that we can calculate without running any part of the build (in particular, without compiling and running build scripts).
 
-1. We start with the build plan.
-   1. Note that [build plan invocations are incomplete](https://github.com/rust-lang/cargo/issues/7614#issue-526685181) because they do not run build scripts. However, build script directives can never change the shape of the dependency graph (see [here](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-cfg:~:text=Note%20that%20this%20does%20not%20affect%20Cargo%E2%80%99s%20dependency%20resolution.%20This%20cannot%20be%20used%20to%20enable%20an%20optional%20dependency%2C%20or%20enable%20other%20Cargo%20features.)), and can never change the `OUT_DIR`, so these invocations are safe to rely upon in our case.
-2. We use the `deps` in the build plan to collate invocations into "library units". A library unit is a dependency's library crate, that library crate's build script compilation, and that library crate's build script execution.
+1. We start with the unit graph.
+   1. The unit graph does not run build scripts. However, build script directives can never change the shape of the dependency graph (see [here](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-cfg:~:text=Note%20that%20this%20does%20not%20affect%20Cargo%E2%80%99s%20dependency%20resolution.%20This%20cannot%20be%20used%20to%20enable%20an%20optional%20dependency%2C%20or%20enable%20other%20Cargo%20features.)), and can never change the `OUT_DIR`, so this graph is safe to rely upon in our case.
+2. We use the `dependencies` in the unit graph to collate invocations into "library units". A library unit is a dependency's library crate, that library crate's build script compilation, and that library crate's build script execution.
 
 Now, for each unit, we should know:
 1. Its compiled artifact folder.
 2. Its build script folder.
 3. Its build script execution folder.
 4. Its dependencies.
-5. Its planned `rustc` invocation argv.
+5. Its reconstructed output paths and Cargo unit hash.
 6. Its build script directives.
 
 Second, we run the build.

@@ -1,4 +1,15 @@
-.PHONY: help format check check-fix autoinherit machete machete-fix cargo-sort precommit dev release sqlx-prepare install install-dev reset-local-cache courier-local-auth
+SCCACHE_BUCKET ?= tilde-sccache-prod
+SCCACHE_REGION ?= us-east-1
+HURRY_ARTIFACT_PREFIX ?= hurry/releases/latest
+HURRY_LINUX_TARGET ?= x86_64-unknown-linux-gnu
+HURRY_MAC_TARGET ?= aarch64-apple-darwin
+HURRY_MAC_SDKROOT ?= /opt/MacOSX11.3.sdk
+HURRY_LINUX_BIN := target/$(HURRY_LINUX_TARGET)/release/hurry
+HURRY_MAC_BIN := target/$(HURRY_MAC_TARGET)/release/hurry
+HURRY_LINUX_S3_URI := s3://$(SCCACHE_BUCKET)/$(HURRY_ARTIFACT_PREFIX)/hurry-$(HURRY_LINUX_TARGET)
+HURRY_MAC_S3_URI := s3://$(SCCACHE_BUCKET)/$(HURRY_ARTIFACT_PREFIX)/hurry-$(HURRY_MAC_TARGET)
+
+.PHONY: help format check check-fix autoinherit machete machete-fix cargo-sort precommit dev release sqlx-prepare install install-dev reset-local-cache courier-local-auth hurry-build-linux hurry-build-mac _hurry-build-mac-with-sdk hurry-upload-linux hurry-upload-mac hurry-upload-all
 
 .DEFAULT_GOAL := help
 
@@ -14,6 +25,11 @@ help:
 	@echo "  make sqlx-prepare       - Prepare sqlx metadata for courier and hurry"
 	@echo "  make install            - Install hurry locally"
 	@echo "  make install-dev        - Install hurry locally, renaming to 'hurry-dev'"
+	@echo "  make hurry-build-linux  - Build hurry for Linux ($(HURRY_LINUX_TARGET))"
+	@echo "  make hurry-build-mac    - Build hurry for macOS ($(HURRY_MAC_TARGET))"
+	@echo "  make hurry-upload-linux - Build and upload Linux hurry binary to S3"
+	@echo "  make hurry-upload-mac   - Build and upload macOS hurry binary to S3"
+	@echo "  make hurry-upload-all   - Build and upload Linux + macOS hurry binaries to S3"
 	@echo "  make reset-local-cache  - Reset local courier instance (docker down, clear data, migrate)"
 	@echo "  make courier-local-auth - Load auth fixture data into local courier database"
 
@@ -45,6 +61,45 @@ dev:
 
 release:
 	cargo build --release
+
+hurry-build-linux:
+	rustup target add $(HURRY_LINUX_TARGET)
+	cargo build --release -p hurry --bin hurry --target $(HURRY_LINUX_TARGET)
+	@chmod +x "$(HURRY_LINUX_BIN)"
+	@"$(HURRY_LINUX_BIN)" --version
+
+hurry-build-mac:
+	@rustup target add $(HURRY_MAC_TARGET)
+	@if [ -z "$${SDKROOT:-}" ] && [ -d "$(HURRY_MAC_SDKROOT)" ]; then \
+		export SDKROOT="$(HURRY_MAC_SDKROOT)"; \
+		echo "Using SDKROOT=$$SDKROOT"; \
+		$(MAKE) _hurry-build-mac-with-sdk SDKROOT="$$SDKROOT"; \
+	else \
+		$(MAKE) _hurry-build-mac-with-sdk; \
+	fi
+
+_hurry-build-mac-with-sdk:
+	@if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then \
+		cargo zigbuild --release -p hurry --bin hurry --target $(HURRY_MAC_TARGET); \
+	elif command -v cross >/dev/null 2>&1; then \
+		cross build --release -p hurry --bin hurry --target $(HURRY_MAC_TARGET); \
+	else \
+		echo "ERROR: macOS cross build requires cargo-zigbuild + zig, or cross."; \
+		echo "Install prerequisites, then rerun: make hurry-build-mac"; \
+		exit 1; \
+	fi
+	@chmod +x "$(HURRY_MAC_BIN)"
+	@file "$(HURRY_MAC_BIN)"
+
+hurry-upload-linux: hurry-build-linux
+	aws s3 cp "$(HURRY_LINUX_BIN)" "$(HURRY_LINUX_S3_URI)" --region "$(SCCACHE_REGION)"
+	aws s3 ls "$(HURRY_LINUX_S3_URI)" --region "$(SCCACHE_REGION)"
+
+hurry-upload-mac: hurry-build-mac
+	aws s3 cp "$(HURRY_MAC_BIN)" "$(HURRY_MAC_S3_URI)" --region "$(SCCACHE_REGION)"
+	aws s3 ls "$(HURRY_MAC_S3_URI)" --region "$(SCCACHE_REGION)"
+
+hurry-upload-all: hurry-upload-linux hurry-upload-mac
 
 sqlx-prepare:
 	cargo sqlx prepare --database-url $(COURIER_DATABASE_URL) --workspace

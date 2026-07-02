@@ -2,7 +2,7 @@
 //!
 //! This module provides utilities for managing Cross.toml configuration to
 //! ensure RUSTC_BOOTSTRAP environment variable is passed through to Docker
-//! containers, which is required for using unstable features like --build-plan.
+//! containers, which is required for using unstable features like --unit-graph.
 
 use color_eyre::{
     Result, Section, SectionExt,
