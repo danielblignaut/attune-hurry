@@ -3,12 +3,13 @@ SCCACHE_REGION ?= us-east-1
 HURRY_ARTIFACT_PREFIX ?= hurry/releases/latest
 HURRY_LINUX_TARGET ?= x86_64-unknown-linux-gnu
 HURRY_MAC_TARGET ?= aarch64-apple-darwin
+HURRY_MAC_SDKROOT ?= /opt/MacOSX11.3.sdk
 HURRY_LINUX_BIN := target/$(HURRY_LINUX_TARGET)/release/hurry
 HURRY_MAC_BIN := target/$(HURRY_MAC_TARGET)/release/hurry
 HURRY_LINUX_S3_URI := s3://$(SCCACHE_BUCKET)/$(HURRY_ARTIFACT_PREFIX)/hurry-$(HURRY_LINUX_TARGET)
 HURRY_MAC_S3_URI := s3://$(SCCACHE_BUCKET)/$(HURRY_ARTIFACT_PREFIX)/hurry-$(HURRY_MAC_TARGET)
 
-.PHONY: help format check check-fix autoinherit machete machete-fix cargo-sort precommit dev release sqlx-prepare install install-dev reset-local-cache courier-local-auth hurry-build-linux hurry-build-mac hurry-upload-linux hurry-upload-mac hurry-upload-all
+.PHONY: help format check check-fix autoinherit machete machete-fix cargo-sort precommit dev release sqlx-prepare install install-dev reset-local-cache courier-local-auth hurry-build-linux hurry-build-mac _hurry-build-mac-with-sdk hurry-upload-linux hurry-upload-mac hurry-upload-all
 
 .DEFAULT_GOAL := help
 
@@ -69,6 +70,15 @@ hurry-build-linux:
 
 hurry-build-mac:
 	@rustup target add $(HURRY_MAC_TARGET)
+	@if [ -z "$${SDKROOT:-}" ] && [ -d "$(HURRY_MAC_SDKROOT)" ]; then \
+		export SDKROOT="$(HURRY_MAC_SDKROOT)"; \
+		echo "Using SDKROOT=$$SDKROOT"; \
+		$(MAKE) _hurry-build-mac-with-sdk SDKROOT="$$SDKROOT"; \
+	else \
+		$(MAKE) _hurry-build-mac-with-sdk; \
+	fi
+
+_hurry-build-mac-with-sdk:
 	@if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then \
 		cargo zigbuild --release -p hurry --bin hurry --target $(HURRY_MAC_TARGET); \
 	elif command -v cross >/dev/null 2>&1; then \
