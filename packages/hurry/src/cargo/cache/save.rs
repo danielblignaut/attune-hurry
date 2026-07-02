@@ -1,6 +1,12 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
-use color_eyre::{Result, eyre::bail};
+use color_eyre::{
+    Report, Result,
+    eyre::{OptionExt as _, bail},
+};
 use futures::stream;
 use serde::{Deserialize, Serialize};
 use tap::{Conv as _, Pipe as _};
@@ -11,6 +17,7 @@ use crate::{
         Fingerprint, QualifiedPath, Restored, RustcTarget, UnitPlan, Workspace, host_glibc_version,
     },
     cas::CourierCas,
+    fs,
     path::{AbsDirPath, AbsFilePath, JoinWith as _},
 };
 use clients::{
@@ -20,6 +27,13 @@ use clients::{
         cache::{CargoSaveRequest, CargoSaveUnitRequest},
     },
 };
+
+#[derive(Clone)]
+struct FingerprintRewriteInput {
+    target: RustcTarget,
+    src_path: Option<AbsFilePath>,
+    fingerprint: Fingerprint,
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SaveProgress {
@@ -40,21 +54,42 @@ pub async fn save_units(
 ) -> Result<()> {
     trace!(?units, ?skip, "saving units");
 
-    let mut progress = SaveProgress {
-        uploaded_units: 0,
-        total_units: units.len() as u64,
-        uploaded_files: 0,
-        uploaded_bytes: 0,
-    };
-
     // TODO: This algorithm currently uploads units one at a time. Instead, we
     // should batch units together up to around 10MB in file size for optimal
     // upload speed. One way we could do this is have units present their
     // CAS-able contents, batch those contents up, and then issue save requests
     // for batches of units as their CAS contents are finished uploading.
     let mut save_requests = Vec::new();
-    let mut dep_fingerprints = HashMap::new();
+    let mut fingerprint_inputs = HashMap::new();
+    let mut units_to_save = Vec::new();
     for unit in units {
+        if !has_fingerprint_files(&ws, &unit).await? {
+            debug!(?unit, "skipping unit backup: fingerprint files are missing");
+            continue;
+        }
+
+        let fingerprint = unit.read_fingerprint(&ws).await?;
+        let old_hash = fingerprint.hash_u64();
+        fingerprint_inputs.insert(
+            old_hash,
+            FingerprintRewriteInput {
+                target: unit.info().target_arch.clone(),
+                src_path: unit.src_path(),
+                fingerprint,
+            },
+        );
+        units_to_save.push(unit);
+    }
+
+    let mut progress = SaveProgress {
+        uploaded_units: 0,
+        total_units: units_to_save.len() as u64,
+        uploaded_files: 0,
+        uploaded_bytes: 0,
+    };
+
+    let mut dep_fingerprints = HashMap::new();
+    for unit in units_to_save {
         debug!(?unit, "saving unit");
         if skip.units.contains(&unit.info().unit_hash) {
             debug!(?unit, "skipping unit backup: unit was restored from cache");
@@ -64,10 +99,11 @@ pub async fn save_units(
             // Even skipped units need to have their rewritten fingerprints
             // calculated, so that we have those values ready in case these
             // units are `dep`s of a downstream unit that is not skipped.
-            rewrite_fingerprint(
+            let _ = rewrite_fingerprint_for_save(
                 &ws,
                 &unit.info().target_arch,
                 unit.src_path(),
+                &fingerprint_inputs,
                 &mut dep_fingerprints,
                 unit.read_fingerprint(&ws).await?,
             )
@@ -124,7 +160,30 @@ pub async fn save_units(
         match unit {
             UnitPlan::LibraryCrate(plan) => {
                 // Read unit files.
-                let files = plan.read(&ws).await?;
+                let files = match plan.read(&ws).await {
+                    Ok(files) => files,
+                    Err(error) if is_missing_unit_file(&error) => {
+                        debug!(?error, "skipping unit backup: unit files are missing");
+                        progress.total_units -= 1;
+                        on_progress(&progress);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(fingerprint) = rewrite_fingerprint_for_save(
+                    &ws,
+                    &plan.info.target_arch,
+                    Some(plan.src_path.clone()),
+                    &fingerprint_inputs,
+                    &mut dep_fingerprints,
+                    files.fingerprint.clone(),
+                )
+                .await?
+                else {
+                    progress.total_units -= 1;
+                    on_progress(&progress);
+                    continue;
+                };
 
                 // Prepare CAS objects.
                 let mut cas_uploads = Vec::new();
@@ -168,14 +227,6 @@ pub async fn save_units(
                 }
 
                 // Prepare save request.
-                let fingerprint = rewrite_fingerprint(
-                    &ws,
-                    &plan.info.target_arch,
-                    Some(plan.src_path.clone()),
-                    &mut dep_fingerprints,
-                    files.fingerprint,
-                )
-                .await?;
                 let save_request = CargoSaveUnitRequest::builder()
                     .unit(courier::SavedUnit::LibraryCrate(
                         courier::LibraryFiles::builder()
@@ -194,7 +245,30 @@ pub async fn save_units(
             }
             UnitPlan::BuildScriptCompilation(plan) => {
                 // Read unit files.
-                let files = plan.read(&ws).await?;
+                let files = match plan.read(&ws).await {
+                    Ok(files) => files,
+                    Err(error) if is_missing_unit_file(&error) => {
+                        debug!(?error, "skipping unit backup: unit files are missing");
+                        progress.total_units -= 1;
+                        on_progress(&progress);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(fingerprint) = rewrite_fingerprint_for_save(
+                    &ws,
+                    &plan.info.target_arch,
+                    Some(plan.src_path.clone()),
+                    &fingerprint_inputs,
+                    &mut dep_fingerprints,
+                    files.fingerprint.clone(),
+                )
+                .await?
+                else {
+                    progress.total_units -= 1;
+                    on_progress(&progress);
+                    continue;
+                };
 
                 // Prepare CAS objects.
                 let mut cas_uploads = Vec::new();
@@ -227,14 +301,6 @@ pub async fn save_units(
                 }
 
                 // Prepare save request.
-                let fingerprint = rewrite_fingerprint(
-                    &ws,
-                    &plan.info.target_arch,
-                    Some(plan.src_path.clone()),
-                    &mut dep_fingerprints,
-                    files.fingerprint,
-                )
-                .await?;
                 let save_request = CargoSaveUnitRequest::builder()
                     .unit(courier::SavedUnit::BuildScriptCompilation(
                         courier::BuildScriptCompiledFiles::builder()
@@ -253,7 +319,30 @@ pub async fn save_units(
             }
             UnitPlan::BuildScriptExecution(plan) => {
                 // Read unit files.
-                let files = plan.read(&ws).await?;
+                let files = match plan.read(&ws).await {
+                    Ok(files) => files,
+                    Err(error) if is_missing_unit_file(&error) => {
+                        debug!(?error, "skipping unit backup: unit files are missing");
+                        progress.total_units -= 1;
+                        on_progress(&progress);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(fingerprint) = rewrite_fingerprint_for_save(
+                    &ws,
+                    &plan.info.target_arch,
+                    None,
+                    &fingerprint_inputs,
+                    &mut dep_fingerprints,
+                    files.fingerprint.clone(),
+                )
+                .await?
+                else {
+                    progress.total_units -= 1;
+                    on_progress(&progress);
+                    continue;
+                };
 
                 // Prepare CAS objects.
                 let mut cas_uploads = Vec::new();
@@ -297,14 +386,6 @@ pub async fn save_units(
                 }
 
                 // Prepare save request.
-                let fingerprint = rewrite_fingerprint(
-                    &ws,
-                    &plan.info.target_arch,
-                    None,
-                    &mut dep_fingerprints,
-                    files.fingerprint,
-                )
-                .await?;
                 let save_request = CargoSaveUnitRequest::builder()
                     .unit(courier::SavedUnit::BuildScriptExecution(
                         courier::BuildScriptOutputFiles::builder()
@@ -334,6 +415,52 @@ pub async fn save_units(
     Result::<_>::Ok(())
 }
 
+async fn has_fingerprint_files(ws: &Workspace, unit: &UnitPlan) -> Result<bool> {
+    let profile_dir = ws.unit_profile_dir(unit.info());
+    Ok(
+        fs::exists(&profile_dir.join(&unit.fingerprint_json_file()?)).await
+            && fs::exists(&profile_dir.join(&unit.fingerprint_hash_file()?)).await,
+    )
+}
+
+async fn rewrite_fingerprint_for_save(
+    ws: &Workspace,
+    target: &RustcTarget,
+    src_path: Option<AbsFilePath>,
+    fingerprint_inputs: &HashMap<u64, FingerprintRewriteInput>,
+    dep_fingerprints: &mut HashMap<u64, Fingerprint>,
+    fingerprint: Fingerprint,
+) -> Result<Option<courier::Fingerprint>> {
+    match rewrite_fingerprint(
+        ws,
+        target,
+        src_path,
+        fingerprint_inputs,
+        dep_fingerprints,
+        fingerprint,
+    )
+    .await
+    {
+        Ok(fingerprint) => Ok(Some(fingerprint)),
+        Err(error) if is_missing_dependency_fingerprint(&error) => {
+            debug!(
+                ?error,
+                "skipping unit backup: dependency fingerprint is missing"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_missing_dependency_fingerprint(error: &Report) -> bool {
+    format!("{error:?}").contains("dependency fingerprint hash not found")
+}
+
+fn is_missing_unit_file(error: &Report) -> bool {
+    format!("{error:?}").contains("No such file or directory")
+}
+
 /// Rewrite fingerprint `src_path`s to be rooted at a static `$CARGO_HOME`.
 ///
 /// This is necessary so that units compiled on host machines with different
@@ -345,9 +472,73 @@ async fn rewrite_fingerprint(
     ws: &Workspace,
     target: &RustcTarget,
     src_path: Option<AbsFilePath>,
+    fingerprint_inputs: &HashMap<u64, FingerprintRewriteInput>,
     dep_fingerprints: &mut HashMap<u64, Fingerprint>,
     fingerprint: Fingerprint,
 ) -> Result<courier::Fingerprint> {
+    let mut visiting = HashSet::new();
+    let rewritten_fingerprint = rewrite_fingerprint_inner(
+        ws,
+        target,
+        src_path,
+        fingerprint_inputs,
+        dep_fingerprints,
+        &mut visiting,
+        fingerprint,
+    )?;
+    serde_json::to_string(&rewritten_fingerprint)?
+        .conv::<courier::Fingerprint>()
+        .pipe(Ok)
+}
+
+fn rewrite_fingerprint_inner(
+    ws: &Workspace,
+    target: &RustcTarget,
+    src_path: Option<AbsFilePath>,
+    fingerprint_inputs: &HashMap<u64, FingerprintRewriteInput>,
+    dep_fingerprints: &mut HashMap<u64, Fingerprint>,
+    visiting: &mut HashSet<u64>,
+    fingerprint: Fingerprint,
+) -> Result<Fingerprint> {
+    let old_hash = fingerprint.hash_u64();
+    if let Some(rewritten) = dep_fingerprints.get(&old_hash) {
+        return Ok(rewritten.clone());
+    }
+    if !visiting.insert(old_hash) {
+        bail!("cycle in fingerprint dependencies");
+    }
+
+    for dep in &fingerprint.deps {
+        let dep_hash = dep.fingerprint.hash_u64();
+        if dep_fingerprints.contains_key(&dep_hash) {
+            continue;
+        }
+        let input = fingerprint_inputs
+            .get(&dep_hash)
+            .cloned()
+            .ok_or_eyre("dependency fingerprint hash not found")?;
+        rewrite_fingerprint_inner(
+            ws,
+            &input.target,
+            input.src_path,
+            fingerprint_inputs,
+            dep_fingerprints,
+            visiting,
+            input.fingerprint,
+        )?;
+    }
+
+    let src_path = rewrite_src_path(ws, target, src_path)?;
+    let rewritten = fingerprint.rewrite(src_path, dep_fingerprints)?;
+    visiting.remove(&old_hash);
+    Ok(rewritten)
+}
+
+fn rewrite_src_path(
+    ws: &Workspace,
+    target: &RustcTarget,
+    src_path: Option<AbsFilePath>,
+) -> Result<Option<PathBuf>> {
     let src_path = match src_path {
         Some(ref src_path) => {
             let qualified = QualifiedPath::parse_abs(ws, target, src_path);
@@ -367,8 +558,5 @@ async fn rewrite_fingerprint(
         }
         None => None,
     };
-    let rewritten_fingerprint = fingerprint.rewrite(src_path, dep_fingerprints)?;
-    serde_json::to_string(&rewritten_fingerprint)?
-        .conv::<courier::Fingerprint>()
-        .pipe(Ok)
+    Ok(src_path)
 }

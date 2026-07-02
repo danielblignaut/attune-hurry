@@ -1,6 +1,6 @@
 //! HTTP client for the Courier v1 API.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_compression::{
     Level,
@@ -39,6 +39,8 @@ use crate::{
 /// all blobs in a bulk operation or tar archive, only the size of each
 /// decompressed blob.
 const MAX_DECOMPRESSED_SIZE: usize = 1024 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Client for the Courier API.
 ///
@@ -63,6 +65,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .gzip(true)
             .brotli(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .context("build http client")?;
 

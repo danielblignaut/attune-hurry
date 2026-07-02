@@ -1,9 +1,6 @@
 use std::hash::{Hash, Hasher};
 
-use color_eyre::{
-    Result,
-    eyre::{Context as _, OptionExt as _},
-};
+use color_eyre::{Result, eyre::Context as _};
 use serde::Deserialize;
 
 use crate::{
@@ -103,6 +100,14 @@ impl UnitGraphUnit {
                 || self
                     .target
                     .kind
+                    .contains(&cargo_metadata::TargetKind::DyLib)
+                || self
+                    .target
+                    .kind
+                    .contains(&cargo_metadata::TargetKind::StaticLib)
+                || self
+                    .target
+                    .kind
                     .contains(&cargo_metadata::TargetKind::ProcMacro))
     }
 }
@@ -141,6 +146,7 @@ impl Hash for UnitGraphProfile {
         self.rpath.hash(state);
         self.incremental.hash(state);
         self.panic.hash(state);
+        self.strip.hash(state);
     }
 }
 
@@ -170,11 +176,4 @@ impl Hash for UnitGraphUnit {
         self.features.hash(state);
         self.is_std.hash(state);
     }
-}
-
-pub fn parse_package_id_source(pkg_id: &str) -> Result<(&str, &str)> {
-    let (source, package) = pkg_id
-        .rsplit_once('#')
-        .ok_or_eyre("unit graph package id should include source and package")?;
-    Ok((source, package))
 }

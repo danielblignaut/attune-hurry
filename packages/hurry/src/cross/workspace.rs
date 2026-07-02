@@ -216,6 +216,7 @@ mod tests {
             target_arch: crate::cargo::RustcTarget::ImplicitHost,
             host_arch: crate::cargo::RustcTargetPlatform::try_from("x86_64-unknown-linux-gnu")
                 .unwrap(),
+            packages: std::collections::BTreeMap::new(),
         }
     }
 

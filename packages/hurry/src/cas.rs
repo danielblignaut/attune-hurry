@@ -1,11 +1,13 @@
-use std::{collections::BTreeSet, convert::identity, fmt::Debug};
+use std::{collections::BTreeSet, convert::identity, fmt::Debug, time::Duration};
 
 use clients::{Courier, Token, courier::v1::Key};
 use color_eyre::{Result, eyre::OptionExt};
 use derive_more::Display;
-use futures::Stream;
-use tracing::{debug, instrument};
+use futures::{Stream, StreamExt as _, stream};
+use tracing::{debug, instrument, warn};
 use url::Url;
+
+const BULK_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The remote content-addressed storage area backed by Courier.
 #[derive(Clone, Debug, Display)]
@@ -64,21 +66,76 @@ impl CourierCas {
         &self,
         entries: impl Stream<Item = (Key, Vec<u8>)> + Unpin + Send + 'static,
     ) -> Result<BulkStoreResult> {
-        self.client
-            .cas_write_bulk(entries)
-            .await
-            .map(|response| BulkStoreResult {
-                written: response.written,
-                skipped: response.skipped,
-                errors: response
-                    .errors
-                    .into_iter()
-                    .map(|item| BulkStoreError {
-                        key: item.key,
-                        error: item.error,
-                    })
-                    .collect(),
-            })
+        let entries = entries.collect::<Vec<_>>().await;
+        if entries.is_empty() {
+            return Ok(BulkStoreResult {
+                written: BTreeSet::new(),
+                skipped: BTreeSet::new(),
+                errors: BTreeSet::new(),
+            });
+        }
+
+        match tokio::time::timeout(
+            BULK_WRITE_TIMEOUT,
+            self.client.cas_write_bulk(stream::iter(entries.clone())),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                return Ok(BulkStoreResult {
+                    written: response.written,
+                    skipped: response.skipped,
+                    errors: response
+                        .errors
+                        .into_iter()
+                        .map(|item| BulkStoreError {
+                            key: item.key,
+                            error: item.error,
+                        })
+                        .collect(),
+                });
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    ?err,
+                    "bulk CAS write failed; falling back to individual writes"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    timeout_seconds = BULK_WRITE_TIMEOUT.as_secs(),
+                    "bulk CAS write timed out; falling back to individual writes"
+                );
+            }
+        }
+
+        self.store_individually(entries).await
+    }
+
+    async fn store_individually(&self, entries: Vec<(Key, Vec<u8>)>) -> Result<BulkStoreResult> {
+        let mut written = BTreeSet::new();
+        let skipped = BTreeSet::new();
+        let mut errors = BTreeSet::new();
+
+        for (key, content) in entries {
+            let actual_key = Key::from_buffer(&content);
+            if actual_key != key {
+                errors.insert(BulkStoreError {
+                    key,
+                    error: format!("hash mismatch: content hashes to {actual_key}"),
+                });
+                continue;
+            }
+
+            self.client.cas_write_bytes(&key, content).await?;
+            written.insert(key);
+        }
+
+        Ok(BulkStoreResult {
+            written,
+            skipped,
+            errors,
+        })
     }
 
     /// Get multiple entries from the CAS via bulk read.

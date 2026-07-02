@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt::Debug, time::SystemTime};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt::Debug,
+    io::Write as _,
+    time::SystemTime,
+};
 
 use cargo_metadata::TargetKind;
 use color_eyre::{
@@ -16,14 +21,12 @@ use crate::{
     cargo::{
         self, BuildPlan, BuildScriptCompilationUnitPlan, BuildScriptExecutionUnitPlan,
         CargoBuildArguments, CargoCompileMode, Fingerprint, LibraryCrateUnitPlan, Profile,
-        RustcArguments, RustcTarget, RustcTargetPlatform, UnitGraph,
+        RustcArguments, RustcTarget, RustcTargetPlatform, UnitGraph, UnitGraphUnit,
     },
     mk_rel_dir,
     path::{AbsDirPath, AbsFilePath, RelDirPath, RelFilePath, RelativeTo as _, TryJoinWith as _},
 };
 use clients::courier::v1 as courier;
-
-use super::unit_hash;
 
 /// The Cargo workspace of a build.
 ///
@@ -58,6 +61,14 @@ pub struct Workspace {
 
     /// The architecture of the host machine.
     pub host_arch: RustcTargetPlatform,
+
+    /// Cargo package names and versions keyed by package id.
+    ///
+    /// Cargo's unit graph omits package names for some sources, notably git
+    /// dependencies. The package name is still needed to reconstruct Cargo's
+    /// `.fingerprint/{package}-{hash}` and `build/{package}-{hash}` paths.
+    #[serde(default)]
+    pub packages: BTreeMap<String, (String, String)>,
 }
 
 impl Workspace {
@@ -69,7 +80,7 @@ impl Workspace {
     ) -> Result<Self> {
         let args = args.as_ref();
 
-        let (root, build_dir) = {
+        let (root, build_dir, packages) = {
             // TODO: Maybe we should just replicate this logic and perform it
             // statically using filesystem operations instead of shelling out?
             // This costs something on the order of 200ms, which is not
@@ -93,11 +104,23 @@ impl Workspace {
             .context("join task")?
             .tap_ok(|metadata| trace!(?metadata, "cargo metadata"))
             .context("get cargo metadata")?;
+            let packages = metadata
+                .packages
+                .iter()
+                .map(|package| {
+                    (
+                        package.id.to_string(),
+                        (package.name.to_string(), package.version.to_string()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+
             (
                 AbsDirPath::try_from(&metadata.workspace_root)
                     .context("parse workspace root as absolute directory")?,
                 AbsDirPath::try_from(&metadata.target_directory)
                     .context("parse workspace target as absolute directory")?,
+                packages,
             )
         };
 
@@ -114,6 +137,7 @@ impl Workspace {
         let host_arch = {
             let mut cmd = tokio::process::Command::new("cargo");
             cmd.args(["-Z", "unstable-options", "rustc", "--print", "host-tuple"]);
+            cmd.current_dir(root.as_std_path());
             // This is apparently still unstable[^1] when invoked as `cargo
             // rustc`.
             //
@@ -150,6 +174,7 @@ impl Workspace {
             profile,
             target_arch,
             host_arch,
+            packages,
         })
     }
 
@@ -233,28 +258,6 @@ impl Workspace {
         }
     }
 
-    async fn rustc_verbose_version(&self) -> Result<String> {
-        let output = tokio::process::Command::new("rustc")
-            .arg("-vV")
-            .output()
-            .await
-            .context("run rustc -vV")?;
-        if !output.status.success() {
-            return Err(eyre!("invoke rustc -vV"))
-                .with_section(|| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .to_string()
-                        .header("Stdout:")
-                })
-                .with_section(|| {
-                    String::from_utf8_lossy(&output.stderr)
-                        .to_string()
-                        .header("Stderr:")
-                });
-        }
-        Ok(String::from_utf8(output.stdout)?)
-    }
-
     fn reconstructed_library_outputs(
         &self,
         info: &UnitPlanInfo,
@@ -268,9 +271,15 @@ impl Workspace {
         let hash = info.unit_hash.to_string();
         let mut outputs = Vec::new();
 
+        let emits_rmeta = !target_kind.contains(&TargetKind::CDyLib)
+            && !target_kind.contains(&TargetKind::DyLib)
+            && !target_kind.contains(&TargetKind::StaticLib);
+
         if target_kind.contains(&TargetKind::Lib) || target_kind.contains(&TargetKind::RLib) {
             outputs.push(deps_dir.try_join_file(format!("lib{name}-{hash}.rlib"))?);
-            outputs.push(deps_dir.try_join_file(format!("lib{name}-{hash}.rmeta"))?);
+            if emits_rmeta {
+                outputs.push(deps_dir.try_join_file(format!("lib{name}-{hash}.rmeta"))?);
+            }
         }
 
         if target_kind.contains(&TargetKind::ProcMacro) {
@@ -281,11 +290,19 @@ impl Workspace {
             ))?);
         }
 
-        if target_kind.contains(&TargetKind::CDyLib) {
+        if target_kind.contains(&TargetKind::CDyLib) || target_kind.contains(&TargetKind::DyLib) {
             outputs.push(deps_dir.try_join_file(format!(
                 "{}{name}-{hash}{}",
                 self.dynamic_library_prefix(&info.target_arch),
                 self.dynamic_library_suffix(&info.target_arch)
+            ))?);
+        }
+
+        if target_kind.contains(&TargetKind::StaticLib) {
+            outputs.push(deps_dir.try_join_file(format!(
+                "{}{name}-{hash}{}",
+                self.static_library_prefix(&info.target_arch),
+                self.static_library_suffix(&info.target_arch)
             ))?);
         }
 
@@ -308,6 +325,20 @@ impl Workspace {
             target if target.contains("apple") => ".dylib",
             target if target.contains("windows") => ".dll",
             _ => ".so",
+        }
+    }
+
+    fn static_library_prefix(&self, target_arch: &RustcTarget) -> &'static str {
+        match target_arch.as_str().unwrap_or(self.host_arch.as_str()) {
+            target if target.contains("windows") => "",
+            _ => "lib",
+        }
+    }
+
+    fn static_library_suffix(&self, target_arch: &RustcTarget) -> &'static str {
+        match target_arch.as_str().unwrap_or(self.host_arch.as_str()) {
+            target if target.contains("windows") => ".lib",
+            _ => ".a",
         }
     }
 
@@ -371,7 +402,9 @@ impl Workspace {
         args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
     ) -> Result<Vec<UnitPlan>> {
         let unit_graph = self.unit_graph(&args).await?;
-        self.units_from_unit_graph(unit_graph).await
+        let unit_hashes = self.cargo_unit_hashes(&args, &unit_graph).await?;
+        self.units_from_unit_graph_with_hashes(unit_graph, unit_hashes)
+            .await
     }
 
     #[instrument(name = "Workspace::units_from_unit_graph", skip(unit_graph))]
@@ -379,19 +412,212 @@ impl Workspace {
         &self,
         unit_graph: UnitGraph,
     ) -> Result<Vec<UnitPlan>> {
-        trace!(?unit_graph, "unit graph");
+        self.units_from_unit_graph_with_hashes(unit_graph, HashMap::new())
+            .await
+    }
 
-        let rustc_verbose_version = self.rustc_verbose_version().await?;
-        let metadata = unit_hash::compute_all(
-            &unit_graph.units,
-            &rustc_verbose_version,
-            self.root.as_std_path().to_string_lossy().as_ref(),
-        )?;
+    #[instrument(name = "Workspace::cargo_unit_hashes", skip(args, unit_graph))]
+    async fn cargo_unit_hashes(
+        &self,
+        args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
+        unit_graph: &UnitGraph,
+    ) -> Result<HashMap<usize, UnitHash>> {
+        let target_dir = tempfile::tempdir().context("create cargo probe target dir")?;
+        let rustc_log_path = target_dir.path().join("rustc.log");
+        let build_script_log_path = target_dir.path().join("build-scripts.log");
+        let mut wrapper = tempfile::NamedTempFile::new().context("create rustc wrapper")?;
+        wrapper
+            .write_all(
+                br#"#!/bin/sh
+rustc="$1"
+shift
+for arg in "$@"; do
+  case "$arg" in
+    -vV|--version|-V|--print|--print=*) exec "$rustc" "$@" ;;
+  esac
+done
+crate_name=""
+out_dir=""
+extra=""
+crate_types=""
+src=""
+opt_level=""
+debug_assertions="false"
+overflow_checks="false"
+codegen_units=""
+features=""
+prev=""
+for arg in "$@"; do
+  if [ -n "$prev" ]; then
+    case "$prev" in
+      crate_name) crate_name="$arg" ;;
+      crate_type) crate_types="$crate_types $arg" ;;
+      out_dir) out_dir="$arg" ;;
+      codegen)
+        case "$arg" in
+          extra-filename=*) extra="${arg#extra-filename=}" ;;
+          opt-level=*) opt_level="${arg#opt-level=}" ;;
+          debug-assertions=*) debug_assertions="${arg#debug-assertions=}" ;;
+          overflow-checks=*) overflow_checks="${arg#overflow-checks=}" ;;
+          codegen-units=*) codegen_units="${arg#codegen-units=}" ;;
+        esac
+        ;;
+      cfg)
+        case "$arg" in
+          feature=\"*\")
+            feature="${arg#feature=\"}"
+            feature="${feature%\"}"
+            features="$features $feature"
+            ;;
+        esac
+        ;;
+    esac
+    prev=""
+    continue
+  fi
 
-        let mut index_to_hash = HashMap::new();
-        for (idx, meta) in &metadata {
-            index_to_hash.insert(*idx, UnitHash::from(meta.unit_hash()));
+  case "$arg" in
+    --crate-name) prev="crate_name" ;;
+    --crate-name=*) crate_name="${arg#--crate-name=}" ;;
+    --crate-type) prev="crate_type" ;;
+    --crate-type=*) crate_types="$crate_types ${arg#--crate-type=}" ;;
+    --out-dir) prev="out_dir" ;;
+    --out-dir=*) out_dir="${arg#--out-dir=}" ;;
+    -C) prev="codegen" ;;
+    -Cextra-filename=*) extra="${arg#-Cextra-filename=}" ;;
+    -Copt-level=*) opt_level="${arg#-Copt-level=}" ;;
+    -Cdebug-assertions=*) debug_assertions="${arg#-Cdebug-assertions=}" ;;
+    -Coverflow-checks=*) overflow_checks="${arg#-Coverflow-checks=}" ;;
+    -Ccodegen-units=*) codegen_units="${arg#-Ccodegen-units=}" ;;
+    --cfg) prev="cfg" ;;
+    --cfg=feature=\"*\")
+      feature="${arg#--cfg=feature=\"}"
+      feature="${feature%\"}"
+      features="$features $feature"
+      ;;
+    *.rs) if [ -z "$src" ]; then src="$arg"; fi ;;
+  esac
+done
+
+if [ -n "$HURRY_PROBE_RUSTC_LOG" ]; then
+  mkdir -p "$(dirname "$HURRY_PROBE_RUSTC_LOG")"
+  printf 'crate=%s\ttypes=%s\textra=%s\topt=%s\tdebug=%s\toverflow=%s\tcgu=%s\tfeatures=%s\tsrc=%s\tout=%s\n' "$crate_name" "$crate_types" "$extra" "$opt_level" "$debug_assertions" "$overflow_checks" "$codegen_units" "$features" "$src" "$out_dir" >> "$HURRY_PROBE_RUSTC_LOG"
+fi
+
+if [ -z "$crate_name" ] || [ -z "$out_dir" ]; then
+  exit 0
+fi
+
+mkdir -p "$out_dir"
+stem="${crate_name}${extra}"
+printf '%s: %s\n' "$out_dir/$stem.d" "$src" > "$out_dir/$stem.d"
+
+case " $crate_types " in
+  *" lib "*|*" rlib "*)
+    : > "$out_dir/lib${crate_name}${extra}.rlib"
+    : > "$out_dir/lib${crate_name}${extra}.rmeta"
+    ;;
+esac
+
+case " $crate_types " in
+  *" proc-macro "*|*" dylib "*|*" cdylib "*)
+    : > "$out_dir/lib${crate_name}${extra}.so"
+    : > "$out_dir/lib${crate_name}${extra}.so.dwp"
+    ;;
+esac
+
+case " $crate_types " in
+  *" bin "*)
+    cat > "$out_dir/$stem" <<'SCRIPT'
+#!/bin/sh
+features=""
+for name in $(env | sed -n 's/^CARGO_FEATURE_\([^=]*\)=.*/\1/p'); do
+  features="$features $name"
+done
+if [ -n "$HURRY_PROBE_BUILD_SCRIPT_LOG" ]; then
+  mkdir -p "$(dirname "$HURRY_PROBE_BUILD_SCRIPT_LOG")"
+  printf 'program=%s\tout=%s\topt=%s\tdebug=%s\ttarget=%s\thost=%s\tfeatures=%s\n' "$0" "$OUT_DIR" "$OPT_LEVEL" "$DEBUG" "$TARGET" "$HOST" "$features" >> "$HURRY_PROBE_BUILD_SCRIPT_LOG"
+fi
+if [ -n "$OUT_DIR" ]; then
+  mkdir -p "$OUT_DIR"
+fi
+exit 0
+SCRIPT
+    chmod +x "$out_dir/$stem"
+    : > "$out_dir/$stem.dwp"
+    ;;
+esac
+
+exit 0
+"#,
+            )
+            .context("write rustc wrapper")?;
+        wrapper.flush().context("flush rustc wrapper")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = wrapper.as_file().metadata()?.permissions();
+            permissions.set_mode(0o755);
+            wrapper.as_file().set_permissions(permissions)?;
         }
+        let wrapper_path = wrapper.into_temp_path();
+
+        let mut command = tokio::process::Command::new("cargo");
+        command
+            .current_dir(self.root.as_std_path())
+            .arg("build")
+            .args(args.as_ref().to_argv())
+            .env("CARGO_TARGET_DIR", target_dir.path())
+            .env(
+                "CARGO_LOG",
+                "cargo::core::compiler::build_runner::compilation_files=debug",
+            )
+            .env("HURRY_PROBE_RUSTC_LOG", &rustc_log_path)
+            .env("HURRY_PROBE_BUILD_SCRIPT_LOG", &build_script_log_path)
+            .env("RUSTC_WRAPPER", &wrapper_path)
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("RUSTC_BOOTSTRAP", "1");
+
+        let output = command.output().await.context("run cargo unit probe")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(eyre!("cargo unit probe failed"))
+                .with_section(|| stdout.to_string().header("Stdout:"))
+                .with_section(|| stderr.to_string().header("Stderr:"));
+        }
+
+        let compile_hashes = parse_compile_hashes(&rustc_log_path)
+            .await
+            .context("parse rustc compile hashes")?;
+        let build_script_execution_hashes =
+            parse_build_script_execution_hashes(&build_script_log_path)
+                .await
+                .context("parse build script execution hashes")?;
+
+        if compile_hashes.is_empty() {
+            return Err(eyre!("cargo unit probe produced no rustc compile hashes"))
+                .with_section(|| stdout.to_string().header("Stdout:"))
+                .with_section(|| stderr.to_string().header("Stderr:"));
+        }
+
+        map_cargo_probe_hashes(
+            unit_graph,
+            self.host_arch.as_str(),
+            &self.cargo_home,
+            &self.packages,
+            compile_hashes,
+            build_script_execution_hashes,
+        )
+    }
+
+    async fn units_from_unit_graph_with_hashes(
+        &self,
+        unit_graph: UnitGraph,
+        index_to_hash: HashMap<usize, UnitHash>,
+    ) -> Result<Vec<UnitPlan>> {
+        trace!(?unit_graph, "unit graph");
 
         let mut units = Vec::new();
         for (idx, unit) in unit_graph.units.into_iter().enumerate() {
@@ -407,16 +633,22 @@ impl Workspace {
                 continue;
             }
 
-            let Some(unit_hash) = index_to_hash.get(&idx).cloned() else {
-                continue;
-            };
-            let (package_name, package_version) = unit.package_name_version()?;
+            let (package_name, package_version) = unit_package_name_version(&unit, &self.packages)?;
+            let unit_hash = index_to_hash
+                .get(&idx)
+                .cloned()
+                .ok_or_eyre("no exact Cargo hash for cacheable unit")?;
             let target_arch = unit.target_arch();
             let deps = unit
                 .dependencies
                 .iter()
-                .filter_map(|dep| index_to_hash.get(&dep.index).cloned())
-                .collect::<Vec<_>>();
+                .map(|dep| {
+                    index_to_hash
+                        .get(&dep.index)
+                        .cloned()
+                        .ok_or_eyre("no exact Cargo hash for dependency")
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             let info = UnitPlanInfo {
                 unit_hash,
@@ -453,7 +685,7 @@ impl Workspace {
             units.push(plan);
         }
 
-        Ok(units)
+        sort_units_by_dependencies(units)
     }
 
     /// Parse unit plans from a build plan.
@@ -762,6 +994,361 @@ impl Workspace {
 
         Ok(units)
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct CompileProbeKey {
+    crate_name: String,
+    crate_types: Vec<String>,
+    profile: ProbeProfile,
+    features: Vec<String>,
+    src_path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct BuildScriptExecutionProbeKey {
+    package_name: String,
+    profile: ProbeProfile,
+    target: String,
+    host: String,
+    features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct ProbeProfile {
+    opt_level: String,
+    codegen_units: Option<u64>,
+    debug_assertions: bool,
+}
+
+impl ProbeProfile {
+    fn from_unit(unit: &UnitGraphUnit) -> Self {
+        let opt_level = normalize_probe_opt_level(&unit.profile.opt_level);
+        Self {
+            debug_assertions: unit.profile.debug_assertions,
+            opt_level,
+            codegen_units: unit.profile.codegen_units,
+        }
+    }
+}
+
+async fn parse_compile_hashes(
+    path: &std::path::Path,
+) -> Result<HashMap<CompileProbeKey, VecDeque<UnitHash>>> {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .context("read rustc hash log")?;
+    let mut hashes = HashMap::<CompileProbeKey, VecDeque<UnitHash>>::new();
+
+    for line in contents.lines() {
+        let fields = parse_probe_fields(line);
+        let Some(src_path) = fields.get("src").filter(|src| !src.is_empty()) else {
+            continue;
+        };
+        let Some(extra) = fields.get("extra").filter(|extra| !extra.is_empty()) else {
+            continue;
+        };
+        let Some(hash) = extra.strip_prefix('-') else {
+            continue;
+        };
+        let Some(crate_name) = fields.get("crate").filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let key = CompileProbeKey {
+            crate_name: (*crate_name).to_string(),
+            crate_types: normalize_crate_types(fields.get("types").copied().unwrap_or_default()),
+            profile: ProbeProfile {
+                opt_level: normalize_probe_opt_level(
+                    fields.get("opt").copied().unwrap_or_default(),
+                ),
+                codegen_units: fields
+                    .get("cgu")
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse::<u64>().ok()),
+                debug_assertions: parse_probe_bool(fields.get("debug").copied().unwrap_or("false")),
+            },
+            features: normalize_probe_features(fields.get("features").copied().unwrap_or_default()),
+            src_path: (*src_path).to_string(),
+        };
+
+        hashes
+            .entry(key)
+            .or_default()
+            .push_back(UnitHash::from(hash));
+    }
+
+    Ok(hashes)
+}
+
+async fn parse_build_script_execution_hashes(
+    path: &std::path::Path,
+) -> Result<HashMap<BuildScriptExecutionProbeKey, VecDeque<UnitHash>>> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).context("read build script execution hash log"),
+    };
+
+    let mut hashes = HashMap::<BuildScriptExecutionProbeKey, VecDeque<UnitHash>>::new();
+    for line in contents.lines() {
+        let fields = parse_probe_fields(line);
+        let Some(out_dir) = fields.get("out").filter(|out_dir| !out_dir.is_empty()) else {
+            continue;
+        };
+        let Some(unit_dir) = out_dir.strip_suffix("/out") else {
+            continue;
+        };
+        let Some(dir_name) = unit_dir.rsplit('/').next() else {
+            continue;
+        };
+        let Some((package, hash)) = split_hash_suffix(dir_name) else {
+            continue;
+        };
+        let key = BuildScriptExecutionProbeKey {
+            package_name: package.to_string(),
+            profile: ProbeProfile {
+                opt_level: normalize_probe_opt_level(
+                    fields.get("opt").copied().unwrap_or_default(),
+                ),
+                codegen_units: None,
+                debug_assertions: parse_probe_bool(fields.get("debug").copied().unwrap_or("false")),
+            },
+            target: fields
+                .get("target")
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+            host: fields.get("host").copied().unwrap_or_default().to_string(),
+            features: normalize_probe_features(fields.get("features").copied().unwrap_or_default()),
+        };
+        hashes
+            .entry(key)
+            .or_default()
+            .push_back(UnitHash::from(hash));
+    }
+
+    Ok(hashes)
+}
+
+fn map_cargo_probe_hashes(
+    unit_graph: &UnitGraph,
+    host_triple: &str,
+    cargo_home: &AbsDirPath,
+    packages: &BTreeMap<String, (String, String)>,
+    mut compile_hashes: HashMap<CompileProbeKey, VecDeque<UnitHash>>,
+    mut build_script_execution_hashes: HashMap<BuildScriptExecutionProbeKey, VecDeque<UnitHash>>,
+) -> Result<HashMap<usize, UnitHash>> {
+    let mut index_to_hash = HashMap::new();
+
+    for (idx, unit) in unit_graph.units.iter().enumerate() {
+        let src_path = unit.src_path()?;
+        if src_path.relative_to(cargo_home).is_err() || unit.is_binary() {
+            continue;
+        }
+
+        if unit.mode == CargoCompileMode::Build {
+            let key = compile_probe_key(unit);
+            let hash = compile_hashes
+                .get_mut(&key)
+                .ok_or_else(|| eyre!("cargo unit probe did not produce compile hash for {key:?}"))?
+                .pop_front()
+                .ok_or_else(|| eyre!("cargo unit probe exhausted compile hashes for {key:?}"))?;
+            index_to_hash.insert(idx, hash);
+        } else if unit.is_build_script_execution() {
+            let (package_name, _) = unit_package_name_version(unit, packages)?;
+            let key = BuildScriptExecutionProbeKey {
+                package_name,
+                profile: ProbeProfile::from_unit(unit),
+                target: unit
+                    .platform
+                    .clone()
+                    .unwrap_or_else(|| host_triple.to_string()),
+                host: host_triple.to_string(),
+                features: normalize_cargo_feature_env_names(&unit.features),
+            };
+            let hash = build_script_execution_hashes
+                .get_mut(&key)
+                .ok_or_else(|| {
+                    eyre!(
+                        "cargo unit probe did not produce build script execution hash for {key:?}"
+                    )
+                })?
+                .pop_front()
+                .ok_or_else(|| {
+                    eyre!("cargo unit probe exhausted build script execution hashes for {key:?}")
+                })?;
+            index_to_hash.insert(idx, hash);
+        }
+    }
+
+    Ok(index_to_hash)
+}
+
+fn unit_package_name_version(
+    unit: &UnitGraphUnit,
+    packages: &BTreeMap<String, (String, String)>,
+) -> Result<(String, String)> {
+    packages
+        .get(&unit.pkg_id)
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| unit.package_name_version())
+}
+
+fn compile_probe_key(unit: &UnitGraphUnit) -> CompileProbeKey {
+    let mut profile = ProbeProfile::from_unit(unit);
+    if profile.opt_level == "0" || unit.is_build_script_compilation() {
+        profile.debug_assertions = false;
+    }
+
+    CompileProbeKey {
+        crate_name: unit.crate_name(),
+        crate_types: unit
+            .target
+            .crate_types
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        profile,
+        features: normalize_unit_features(&unit.features),
+        src_path: unit
+            .target
+            .src_path
+            .as_std_path()
+            .to_string_lossy()
+            .to_string(),
+    }
+}
+
+fn parse_probe_fields(line: &str) -> HashMap<&str, &str> {
+    line.split('\t')
+        .filter_map(|field| field.split_once('='))
+        .collect::<HashMap<_, _>>()
+}
+
+fn normalize_crate_types(value: &str) -> Vec<String> {
+    value.split_whitespace().map(String::from).collect()
+}
+
+fn normalize_probe_features(value: &str) -> Vec<String> {
+    let mut features = value
+        .split_whitespace()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    features.sort();
+    features.dedup();
+    features
+}
+
+fn normalize_unit_features(features: &[String]) -> Vec<String> {
+    let mut features = features.to_vec();
+    features.sort();
+    features.dedup();
+    features
+}
+
+fn normalize_cargo_feature_env_names(features: &[String]) -> Vec<String> {
+    let mut features = features
+        .iter()
+        .map(|feature| {
+            feature
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    features.sort();
+    features.dedup();
+    features
+}
+
+fn normalize_probe_opt_level(value: &str) -> String {
+    if value.is_empty() {
+        String::from("0")
+    } else {
+        String::from(value)
+    }
+}
+
+fn parse_probe_bool(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
+}
+
+fn split_hash_suffix(value: &str) -> Option<(&str, &str)> {
+    let without_debug_suffix = value.strip_suffix(".dwp").unwrap_or(value);
+    let stem = without_debug_suffix
+        .split_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(without_debug_suffix);
+    let (name, hash) = stem.rsplit_once('-')?;
+    if hash.len() == 16 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some((name, hash))
+    } else {
+        None
+    }
+}
+
+fn sort_units_by_dependencies(units: Vec<UnitPlan>) -> Result<Vec<UnitPlan>> {
+    let index_by_hash = units
+        .iter()
+        .enumerate()
+        .map(|(idx, unit)| (unit.info().unit_hash.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut state = vec![VisitState::Unvisited; units.len()];
+    let mut sorted = Vec::with_capacity(units.len());
+
+    for idx in 0..units.len() {
+        visit_unit(idx, &units, &index_by_hash, &mut state, &mut sorted)?;
+    }
+
+    let mut units = units.into_iter().map(Some).collect::<Vec<_>>();
+    sorted
+        .into_iter()
+        .map(|idx| {
+            units
+                .get_mut(idx)
+                .and_then(Option::take)
+                .ok_or_eyre("unit dependency sort produced invalid index")
+        })
+        .collect()
+}
+
+fn visit_unit(
+    idx: usize,
+    units: &[UnitPlan],
+    index_by_hash: &HashMap<UnitHash, usize>,
+    state: &mut [VisitState],
+    sorted: &mut Vec<usize>,
+) -> Result<()> {
+    match state[idx] {
+        VisitState::Visited => return Ok(()),
+        VisitState::Visiting => bail!("cycle in Cargo unit dependencies"),
+        VisitState::Unvisited => {}
+    }
+
+    state[idx] = VisitState::Visiting;
+    for dep in &units[idx].info().deps {
+        if let Some(&dep_idx) = index_by_hash.get(dep) {
+            visit_unit(dep_idx, units, index_by_hash, state, sorted)?;
+        }
+    }
+    state[idx] = VisitState::Visited;
+    sorted.push(idx);
+
+    Ok(())
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum VisitState {
+    Unvisited,
+    Visiting,
+    Visited,
 }
 
 /// This is a newtype for unit hash strings.
